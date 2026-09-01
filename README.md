@@ -2,7 +2,7 @@
 
 Owner-led research carrier for deadline-aware TTFT, TBT, and TTLT scheduling. It is a scheduler policy, not a deployment system or control plane.
 
-**Status: source-preservation and contract-design scaffold. There is no installable runtime implementation or support claim yet.**
+**Status: request-level SLO validation, monotonic deadline tracking, and ordering keys are installable and tested; vLLM API/scheduler attachment remains blocked until `HOST_CONTRACT.md` is implemented.**
 
 Technical ownership belongs to @Yushuo-star. Source extraction must preserve exact authorship, license, tests, constraints, and evidence before activation is considered.
 

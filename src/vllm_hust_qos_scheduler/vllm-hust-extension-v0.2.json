@@ -15,13 +15,26 @@
   },
   "lifecycle_owner": "vllm",
   "protocols": [
-    {"name": "vllm.scheduler.policy.proposed", "version_range": null}
+    {"name": "vllm.request.qos-metadata", "version_range": ">=1,<2"},
+    {"name": "vllm.scheduler.request-snapshot", "version_range": ">=1,<2"},
+    {"name": "vllm.scheduler.ordering-policy", "version_range": ">=1,<2"},
+    {"name": "vllm.scheduler.output-observer", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "qos-ordering-policy",
+      "implementation_ref": "vllm_hust_qos_scheduler.policy:QoSOrderingPolicy",
+      "contracts": ["vllm.scheduler.request-snapshot.v1", "vllm.scheduler.ordering-policy.v1"],
+      "execution_planes": ["scheduler"],
+      "isolation": "trusted_in_process",
+      "permissions": []
+    }
   ],
   "implementation": [
     {
       "type": "python_module",
-      "module": "vllm_hust_qos_scheduler",
-      "object": "VllmHustQosSchedulerContractProposal",
+      "module": "vllm_hust_qos_scheduler.policy",
+      "object": "QoSOrderingPolicy",
       "status": "import_only"
     }
   ],
