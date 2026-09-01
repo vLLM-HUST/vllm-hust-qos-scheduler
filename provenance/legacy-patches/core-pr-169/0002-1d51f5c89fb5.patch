@@ -1,0 +1,1580 @@
+From 0418f4cd707dc8355099649eb6c59329c329d80b Mon Sep 17 00:00:00 2001
+From: Developer <developer@vllm.local>
+Date: Tue, 21 Jul 2026 20:36:23 +0800
+Subject: [PATCH] feat: qos-deadline-schedule
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: Developer <developer@vllm.local>
+---
+ vllm/config/scheduler.py                      |  30 ++
+ vllm/engine/arg_utils.py                      |  11 +
+ vllm/engine/protocol.py                       |   2 +
+ .../openai/chat_completion/protocol.py        |   2 +
+ .../openai/chat_completion/serving.py         |  24 ++
+ .../entrypoints/openai/completion/protocol.py |   2 +
+ vllm/entrypoints/openai/completion/serving.py |  24 ++
+ vllm/entrypoints/openai/engine/protocol.py    |  34 ++
+ vllm/entrypoints/openai/responses/protocol.py |   3 +-
+ vllm/entrypoints/openai/responses/serving.py  |  20 ++
+ vllm/v1/core/sched/qos_policy.py              | 312 ++++++++++++++++++
+ vllm/v1/core/sched/request_queue.py           |  89 ++++-
+ vllm/v1/core/sched/scheduler.py               |  69 +++-
+ vllm/v1/engine/__init__.py                    |   4 +
+ vllm/v1/engine/async_llm.py                   |  15 +
+ vllm/v1/engine/input_processor.py             |  46 +++
+ vllm/v1/engine/llm_engine.py                  |  10 +-
+ vllm/v1/metrics/loggers.py                    |  74 +++++
+ vllm/v1/metrics/stats.py                      |  17 +
+ vllm/v1/qos.py                                | 165 +++++++++
+ vllm/v1/request.py                            |  16 +
+ 21 files changed, 959 insertions(+), 10 deletions(-)
+ create mode 100644 vllm/v1/core/sched/qos_policy.py
+ create mode 100644 vllm/v1/qos.py
+
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 3773a47ec..0bbd44975 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import math
+ from collections.abc import Callable
+ from dataclasses import InitVar
+ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+@@ -166,6 +167,13 @@ class SchedulerConfig:
+     while a larger value (e.g., 10) reduces host overhead and may increase throughput
+     by batching multiple tokens before sending."""
+ 
++    enable_qos_scheduling: bool = False
++    """Enable the Phase 0-3 request-SLO scheduler controller."""
++
++    qos_hybrid_alpha: float = Field(default=0.0, ge=0.0)
++    """Remaining-work weight in seconds per token for hybrid ordering."""
++
++
+     @staticmethod
+     def default_factory(**kwargs):
+         """
+@@ -254,6 +262,28 @@ class SchedulerConfig:
+                 self.max_num_batched_tokens,
+             )
+ 
++        if not math.isfinite(self.qos_hybrid_alpha):
++            raise ValueError("qos_hybrid_alpha must be finite.")
++
++        if self.enable_qos_scheduling:
++            unsupported: list[str] = []
++            if not self.enable_chunked_prefill:
++                unsupported.append("chunked prefill must be enabled")
++            if self.runner_type != "generate":
++                unsupported.append("runner_type must be 'generate'")
++            if self.is_multimodal_model:
++                unsupported.append("multimodal models are not supported")
++            if is_encoder_decoder:
++                unsupported.append("encoder-decoder models are not supported")
++            if self.scheduler_cls is not None:
++                unsupported.append("scheduler_cls must be unset (stock V1 scheduler)")
++            if unsupported:
++                raise ValueError(
++                    "Invalid Phase 0-3 QoS configuration: "
++                    + "; ".join(unsupported)
++                    + "."
++                )
++
+         if self.max_num_partial_prefills > 1:
+             if self.long_prefill_token_threshold == 0:
+                 self.long_prefill_token_threshold = int(max_model_len * 0.04)
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index af4b6fb07..605635b94 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -651,6 +651,8 @@ class EngineArgs:
+     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
+     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
++    enable_qos_scheduling: bool = SchedulerConfig.enable_qos_scheduling
++    qos_hybrid_alpha: float = SchedulerConfig.qos_hybrid_alpha
+ 
+     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
+     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
+@@ -1463,6 +1465,13 @@ class EngineArgs:
+         scheduler_group.add_argument(
+             "--stream-interval", **scheduler_kwargs["stream_interval"]
+         )
++        scheduler_group.add_argument(
++            "--enable-qos-scheduling",
++            **scheduler_kwargs["enable_qos_scheduling"],
++        )
++        scheduler_group.add_argument(
++            "--qos-hybrid-alpha", **scheduler_kwargs["qos_hybrid_alpha"]
++        )
+ 
+         # Compilation arguments
+         compilation_kwargs = get_kwargs(CompilationConfig)
+@@ -2163,6 +2172,8 @@ class EngineArgs:
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+             async_scheduling=self.async_scheduling,
+             stream_interval=self.stream_interval,
++            enable_qos_scheduling=self.enable_qos_scheduling,
++            qos_hybrid_alpha=self.qos_hybrid_alpha,
+         )
+ 
+         if not model_config.is_multimodal_model and self.default_mm_loras:
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 7d5cc164f..954950159 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -20,6 +20,7 @@ from vllm.sampling_params import SamplingParams
+ from vllm.tasks import SupportedTask
+ from vllm.v1.engine import EngineCoreRequest
+ from vllm.v1.engine.input_processor import InputProcessor
++from vllm.v1.qos import QoSParams
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.engine import PauseMode
+@@ -79,6 +80,7 @@ class EngineClient(ABC):
+         data_parallel_rank: int | None = None,
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        qos_params: QoSParams | None = None,
+     ) -> AsyncGenerator[RequestOutput, None]:
+         """Generate outputs for a request."""
+         ...
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 264f42d78..6c8b8cbe3 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -26,6 +26,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     FunctionDefinition,
+     LegacyStructuralTagResponseFormat,
+     OpenAIBaseModel,
++    QoSRequestParams,
+     StreamOptions,
+     StructuralTagResponseFormat,
+     ToolCall,
+@@ -355,6 +356,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             "if the served model does not use priority scheduling."
+         ),
+     )
++    qos: QoSRequestParams | None = None
+     request_id: str = Field(
+         default_factory=random_uuid,
+         description=(
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 284b2511d..e292d1dae 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -247,6 +247,21 @@ class OpenAIServingChat(OpenAIServing):
+         request: ChatCompletionRequest,
+         raw_request: Request | None = None,
+     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
++        if request.qos is not None:
++            if not (
++                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
++            ):
++                return self.create_error_response(
++                    "Request QoS requires the server to enable QoS scheduling."
++                )
++            if request.use_beam_search:
++                return self.create_error_response(
++                    "Request QoS does not support beam search in Phase 0-3."
++                )
++            if request.n not in (None, 1):
++                return self.create_error_response(
++                    "Request QoS does not support parallel sampling in Phase 0-3."
++                )
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
+@@ -264,6 +279,10 @@ class OpenAIServingChat(OpenAIServing):
+             return result
+ 
+         conversation, engine_inputs = result
++        if request.qos is not None and len(engine_inputs) != 1:
++            return self.create_error_response(
++                "Request QoS supports exactly one rendered prompt in Phase 0-3."
++            )
+ 
+         request_id = (
+             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+@@ -364,6 +383,11 @@ class OpenAIServingChat(OpenAIServing):
+                     }
+                     if parser is not None and parser.reasoning_parser is not None
+                     else None,
++                    **(
++                        {}
++                        if request.qos is None
++                        else {"qos_params": request.qos.to_internal()}
++                    ),
+                 )
+ 
+             generators.append(generator)
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index b96d4f3c0..540e1093c 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -15,6 +15,7 @@ from vllm.entrypoints.openai.engine.protocol import (
+     AnyResponseFormat,
+     LegacyStructuralTagResponseFormat,
+     OpenAIBaseModel,
++    QoSRequestParams,
+     StreamOptions,
+     StructuralTagResponseFormat,
+     UsageInfo,
+@@ -125,6 +126,7 @@ class CompletionRequest(OpenAIBaseModel):
+             "if the served model does not use priority scheduling."
+         ),
+     )
++    qos: QoSRequestParams | None = None
+     request_id: str = Field(
+         default_factory=random_uuid,
+         description=(
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 43150191a..9d309d0d0 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -129,6 +129,21 @@ class OpenAIServingCompletion(OpenAIServing):
+         request: CompletionRequest,
+         raw_request: Request | None = None,
+     ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
++        if request.qos is not None:
++            if not (
++                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
++            ):
++                return self.create_error_response(
++                    "Request QoS requires the server to enable QoS scheduling."
++                )
++            if request.use_beam_search:
++                return self.create_error_response(
++                    "Request QoS does not support beam search in Phase 0-3."
++                )
++            if request.n != 1:
++                return self.create_error_response(
++                    "Request QoS does not support parallel sampling in Phase 0-3."
++                )
+         if request.stream and request.use_beam_search:
+             return self.create_error_response(
+                 "Streaming is not currently supported with beam search"
+@@ -139,6 +154,10 @@ class OpenAIServingCompletion(OpenAIServing):
+             return result
+ 
+         engine_inputs = result
++        if request.qos is not None and len(engine_inputs) != 1:
++            return self.create_error_response(
++                "Request QoS supports exactly one prompt in Phase 0-3."
++            )
+ 
+         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+         created_time = int(time.time())
+@@ -208,6 +227,11 @@ class OpenAIServingCompletion(OpenAIServing):
+                     trace_headers=trace_headers,
+                     priority=request.priority,
+                     data_parallel_rank=data_parallel_rank,
++                    **(
++                        {}
++                        if request.qos is None
++                        else {"qos_params": request.qos.to_internal()}
++                    ),
+                 )
+ 
+             generators.append(generator)
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 084d8d429..a8125b144 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -3,6 +3,7 @@
+ 
+ # Adapted from
+ # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
++import math
+ import time
+ from http import HTTPStatus
+ from typing import Any, ClassVar, Literal, TypeAlias
+@@ -21,6 +22,7 @@ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.utils import random_uuid
+ from vllm.utils.import_utils import resolve_obj_by_qualname
++from vllm.v1.qos import MAX_EXPECTED_OUTPUT_TOKENS, QoSParams
+ 
+ logger = init_logger(__name__)
+ 
+@@ -57,6 +59,38 @@ class OpenAIBaseModel(BaseModel):
+         return result
+ 
+ 
++class QoSRequestParams(OpenAIBaseModel):
++    """Request-level SLOs accepted by vLLM's OpenAI-compatible APIs."""
++
++    ttft_slo_ms: float | None = Field(default=None, gt=0.0)
++    tbt_slo_ms: float | None = Field(default=None, gt=0.0)
++    ttlt_slo_ms: float | None = Field(default=None, gt=0.0)
++    expected_output_tokens: int | None = Field(
++        default=None,
++        gt=0,
++        le=MAX_EXPECTED_OUTPUT_TOKENS,
++    )
++    service_class: str | None = Field(default=None, min_length=1, max_length=64)
++
++    @model_validator(mode="after")
++    def validate_qos(self):
++        slos = (self.ttft_slo_ms, self.tbt_slo_ms, self.ttlt_slo_ms)
++        if all(value is None for value in slos):
++            raise ValueError("At least one QoS SLO must be specified.")
++        if any(value is not None and not math.isfinite(value) for value in slos):
++            raise ValueError("QoS SLOs must be finite positive numbers.")
++        return self
++
++    def to_internal(self) -> QoSParams:
++        return QoSParams(
++            ttft_slo_ms=self.ttft_slo_ms,
++            tbt_slo_ms=self.tbt_slo_ms,
++            ttlt_slo_ms=self.ttlt_slo_ms,
++            expected_output_tokens=self.expected_output_tokens,
++            service_class=self.service_class,
++        )
++
++
+ class ErrorInfo(OpenAIBaseModel):
+     message: str
+     type: str
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index eb2d66bdd..bb3bd3839 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -60,7 +60,7 @@ from vllm.entrypoints.chat_utils import (
+     ChatCompletionMessageParam,
+     ChatTemplateContentFormatOption,
+ )
+-from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
++from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, QoSRequestParams
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
+@@ -232,6 +232,7 @@ class ResponsesRequest(OpenAIBaseModel):
+             "if the served model does not use priority scheduling."
+         ),
+     )
++    qos: QoSRequestParams | None = None
+     cache_salt: str | None = Field(
+         default=None,
+         description=(
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 72dddf539..fe81dde00 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -104,6 +104,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils import random_uuid
+ from vllm.utils.collection_utils import as_list
++from vllm.v1.qos import QoSParams
+ 
+ logger = init_logger(__name__)
+ 
+@@ -345,6 +346,17 @@ class OpenAIServingResponses(OpenAIServing):
+         | ResponsesResponse
+         | ErrorResponse
+     ):
++        if request.qos is not None:
++            if not (
++                self.engine_client.vllm_config.scheduler_config.enable_qos_scheduling
++            ):
++                return self.create_error_response(
++                    "Request QoS requires the server to enable QoS scheduling."
++                )
++            if request.tools:
++                return self.create_error_response(
++                    "Request QoS does not support Responses tool loops in Phase 0-3."
++                )
+         error_check_ret = await self._check_model(request)
+         if error_check_ret is not None:
+             logger.error("Error with model %s", error_check_ret)
+@@ -388,6 +400,11 @@ class OpenAIServingResponses(OpenAIServing):
+         else:
+             messages, engine_inputs = await self._make_request(request, prev_response)
+ 
++        if request.qos is not None and len(engine_inputs) != 1:
++            return self.create_error_response(
++                "Request QoS supports exactly one rendered prompt in Phase 0-3."
++            )
++
+         request_metadata = RequestResponseMetadata(request_id=request.request_id)
+         if raw_request:
+             raw_request.state.request_metadata = request_metadata
+@@ -519,6 +536,7 @@ class OpenAIServingResponses(OpenAIServing):
+                 reasoning_parser_kwargs=reasoning_parser_kwargs
+                 if self.parser and self.parser.reasoning_parser_cls is not None
+                 else None,
++                qos_params=(None if request.qos is None else request.qos.to_internal()),
+             )
+             generators.append(generator)
+ 
+@@ -664,6 +682,7 @@ class OpenAIServingResponses(OpenAIServing):
+         priority: int = 0,
+         trace_headers: Mapping[str, str] | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        qos_params: QoSParams | None = None,
+     ):
+         max_model_len = self.model_config.max_model_len
+ 
+@@ -688,6 +707,7 @@ class OpenAIServingResponses(OpenAIServing):
+                 trace_headers=trace_headers,
+                 priority=priority,
+                 reasoning_parser_kwargs=reasoning_parser_kwargs,
++                **({} if qos_params is None else {"qos_params": qos_params}),
+             )
+ 
+             async for res in generator:
+diff --git a/vllm/v1/core/sched/qos_policy.py b/vllm/v1/core/sched/qos_policy.py
+new file mode 100644
+index 000000000..3dcfd8f00
+--- /dev/null
++++ b/vllm/v1/core/sched/qos_policy.py
+@@ -0,0 +1,312 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""QoS-aware request ordering.
++
++Follows the stock FCFS token-budget model: prefill and decode requests
++share a single global ``token_budget`` per step.  The QoS controller only
++reorders requests — decode work is placed before prefill while any QoS
++request has an active deadline — and tracks per-request SLO violations.
++No independent prefill budget is applied.
++"""
++
++import math
++import time
++from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++from vllm.logger import init_logger
++from vllm.v1.metrics.stats import QoSPolicyStats
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++    from vllm.v1.request import Request
++
++logger = init_logger(__name__)
++
++
++@dataclass(frozen=True)
++class QoSStepDecision:
++    """QoS controller decision for one synchronous scheduler step."""
++
++    active: bool
++    total_token_budget: int
++    min_decode_slack_ms: float | None = None
++
++
++class QoSSchedulingPolicy:
++    """Controller used by the stock V1 scheduler when QoS is enabled.
++
++    Provides deadline-aware queue ordering.  Prefill and decode tokens
++    share the scheduler's global ``max_num_scheduled_tokens`` budget
++    (the same as FCFS); QoS only changes *which* requests run first.
++    """
++
++    def __init__(self, vllm_config: "VllmConfig") -> None:
++        config = vllm_config.scheduler_config
++        self.enabled = config.enable_qos_scheduling
++        self.base_priority_enabled = config.policy == "priority"
++        self.max_num_scheduled_tokens = config.max_num_scheduled_tokens or (
++            config.max_num_batched_tokens
++        )
++        self.hybrid_alpha_s_per_token = config.qos_hybrid_alpha
++
++        self.last_decision = self._inactive_decision()
++        self._ttft_observations = 0
++        self._tbt_observations = 0
++        self._ttlt_observations = 0
++        self._ttft_violations = 0
++        self._tbt_violations = 0
++        self._ttlt_violations = 0
++
++        # Counter for O(1) QoS-request existence check.
++        self._qos_request_count: int = 0
++
++        if not self.enabled:
++            return
++        self._validate_supported_runtime(vllm_config)
++        logger.info("QoS scheduling enabled (FCFS token-budget model).")
++
++    def _inactive_decision(self) -> QoSStepDecision:
++        return QoSStepDecision(
++            active=False,
++            total_token_budget=self.max_num_scheduled_tokens,
++        )
++
++    @staticmethod
++    def _validate_supported_runtime(vllm_config: "VllmConfig") -> None:
++        scheduler_config = vllm_config.scheduler_config
++        parallel_config = vllm_config.parallel_config
++        unsupported: list[str] = []
++        if scheduler_config.runner_type != "generate":
++            unsupported.append("non-generative runners")
++        if scheduler_config.is_multimodal_model:
++            unsupported.append("multimodal models")
++        if parallel_config.pipeline_parallel_size != 1:
++            unsupported.append("pipeline parallelism")
++        if parallel_config.data_parallel_size != 1:
++            unsupported.append("data parallelism")
++        if parallel_config.prefill_context_parallel_size != 1:
++            unsupported.append("prefill context parallelism")
++        if parallel_config.decode_context_parallel_size != 1:
++            unsupported.append("decode context parallelism")
++        if parallel_config.use_ubatching:
++            unsupported.append("ubatching/DBO")
++        if parallel_config.enable_expert_parallel:
++            unsupported.append("expert parallelism")
++        if vllm_config.speculative_config is not None:
++            unsupported.append("speculative decoding")
++        if vllm_config.kv_transfer_config is not None:
++            unsupported.append("KV-transfer/P-D disaggregation")
++        if vllm_config.lora_config is not None:
++            unsupported.append("LoRA")
++        if vllm_config.model_config.logits_processors:
++            unsupported.append("model-level logits processors")
++        if vllm_config.model_config.enable_return_routed_experts:
++            unsupported.append("routed-expert return data")
++        if unsupported:
++            raise ValueError(
++                "QoS scheduling Phase 0-3 does not support: "
++                + ", ".join(unsupported)
++                + "."
++            )
++
++    @staticmethod
++    def has_qos_request(requests: Iterable["Request"]) -> bool:
++        return any(
++            request.qos_state is not None and request.qos_state.has_active_deadline()
++            for request in requests
++        )
++
++    def increment_qos_count(self) -> None:
++        self._qos_request_count += 1
++
++    def decrement_qos_count(self) -> None:
++        if self._qos_request_count > 0:
++            self._qos_request_count -= 1
++
++    @staticmethod
++    def _remaining_work(request: "Request") -> int:
++        state = request.qos_state
++        expected_output_tokens = (
++            state.expected_output_tokens if state is not None else request.max_tokens
++        )
++        expected_remaining_output = max(
++            0, expected_output_tokens - request.num_output_tokens
++        )
++        remaining_prefill = max(
++            0, request.num_prompt_tokens - request.num_computed_tokens
++        )
++        return remaining_prefill + expected_remaining_output
++
++    def _hybrid_score(self, deadline: float, remaining_work: int) -> float:
++        if not math.isfinite(deadline):
++            return math.inf
++        try:
++            penalty = self.hybrid_alpha_s_per_token * remaining_work
++        except OverflowError:
++            return math.inf
++        score = deadline + penalty
++        return score if math.isfinite(score) else math.inf
++
++    def waiting_key(self, request: "Request") -> tuple[Any, ...]:
++        priority = request.priority if self.base_priority_enabled else 0
++        if request.qos_state is None or not request.qos_state.has_active_deadline():
++            if self.base_priority_enabled:
++                return (priority, 1, 0.0, request.arrival_time, request.request_id)
++            return (priority, 1, 0.0, 0.0, "")
++        hybrid_score = self._hybrid_score(
++            request.qos_state.waiting_deadline(),
++            self._remaining_work(request),
++        )
++        return (
++            priority,
++            0,
++            hybrid_score,
++            request.arrival_time,
++            request.request_id,
++        )
++
++    def running_key(self, request: "Request") -> tuple[Any, ...]:
++        is_prefill = request.num_computed_tokens < request.num_prompt_tokens
++        priority = request.priority if self.base_priority_enabled else 0
++        deadline = (
++            math.inf
++            if request.qos_state is None
++            else request.qos_state.next_token_deadline()
++        )
++        hybrid_score = self._hybrid_score(deadline, self._remaining_work(request))
++        return (
++            int(is_prefill),
++            priority,
++            hybrid_score,
++            request.arrival_time,
++            request.request_id,
++        )
++
++    def order_running(
++        self, requests: list["Request"], *, active: bool | None = None
++    ) -> None:
++        if self.enabled and (
++            self.has_qos_request(requests) if active is None else active
++        ):
++            requests.sort(key=self.running_key)
++
++    @staticmethod
++    def _decode_demand(request: "Request") -> int:
++        if request.num_computed_tokens < request.num_prompt_tokens:
++            return 0
++        return max(
++            0,
++            request.num_tokens_with_spec
++            + request.num_output_placeholders
++            - request.num_computed_tokens,
++        )
++
++    def start_step(
++        self,
++        *,
++        running: list["Request"],
++        waiting: Iterable["Request"],
++        now: float | None = None,
++    ) -> QoSStepDecision:
++        """Determine whether any active QoS work exists this step.
++
++        Does **not** compute a per-step prefill budget — prefill and decode
++        share the scheduler's global ``max_num_scheduled_tokens``, following
++        the same FCFS model as the stock V1 scheduler.
++        """
++
++        now = time.monotonic() if now is None else now
++        if not self.enabled:
++            self.last_decision = self._inactive_decision()
++            return self.last_decision
++
++        if self._qos_request_count == 0:
++            self.last_decision = self._inactive_decision()
++            return self.last_decision
++
++        all_requests = [*running, *list(waiting)]
++        if not self.has_qos_request(all_requests):
++            self.last_decision = self._inactive_decision()
++            return self.last_decision
++
++        decode_requests = [
++            request for request in running if self._decode_demand(request) > 0
++        ]
++        qos_decode_deadlines = [
++            request.qos_state.next_token_deadline()
++            for request in decode_requests
++            if request.qos_state is not None
++            and math.isfinite(request.qos_state.next_token_deadline())
++        ]
++        min_decode_slack_ms = (
++            None
++            if not qos_decode_deadlines
++            else (min(qos_decode_deadlines) - now) * 1000.0
++        )
++
++        self.last_decision = QoSStepDecision(
++            active=True,
++            total_token_budget=self.max_num_scheduled_tokens,
++            min_decode_slack_ms=min_decode_slack_ms,
++        )
++        return self.last_decision
++
++    def observe_request_output(
++        self,
++        request: "Request",
++        *,
++        num_new_tokens: int,
++        finished: bool,
++        now: float | None = None,
++    ) -> None:
++        if not self.enabled or request.qos_state is None:
++            return
++        now = time.monotonic() if now is None else now
++        state = request.qos_state
++        had_first_token = state.first_token_time is not None
++        if num_new_tokens > 0:
++            if not had_first_token and state.ttft_deadline is not None:
++                self._ttft_observations += 1
++            if state.tbt_slo_s is not None:
++                self._tbt_observations += max(
++                    0,
++                    num_new_tokens - int(not had_first_token),
++                )
++        ttft, tbt = request.qos_state.observe_tokens(num_new_tokens, now)
++        self._ttft_violations += ttft
++        self._tbt_violations += tbt
++        if finished:
++            if state.ttlt_deadline is not None and not state.ttlt_observed:
++                self._ttlt_observations += 1
++            self._ttlt_violations += request.qos_state.observe_finished(now)
++            self.decrement_qos_count()
++
++    def drain_stats(self) -> QoSPolicyStats | None:
++        if not self.enabled:
++            return None
++        decision = self.last_decision
++        stats = QoSPolicyStats(
++            active=int(decision.active),
++            total_token_budget=decision.total_token_budget,
++            min_decode_slack_ms=(
++                math.nan
++                if decision.min_decode_slack_ms is None
++                else decision.min_decode_slack_ms
++            ),
++            ttft_observations=self._ttft_observations,
++            tbt_observations=self._tbt_observations,
++            ttlt_observations=self._ttlt_observations,
++            ttft_violations=self._ttft_violations,
++            tbt_violations=self._tbt_violations,
++            ttlt_violations=self._ttlt_violations,
++        )
++        self._ttft_observations = 0
++        self._tbt_observations = 0
++        self._ttlt_observations = 0
++        self._ttft_violations = 0
++        self._tbt_violations = 0
++        self._ttlt_violations = 0
++        return stats
+diff --git a/vllm/v1/core/sched/request_queue.py b/vllm/v1/core/sched/request_queue.py
+index 38c7db94a..d972c9b4f 100644
+--- a/vllm/v1/core/sched/request_queue.py
++++ b/vllm/v1/core/sched/request_queue.py
+@@ -4,8 +4,10 @@
+ import heapq
+ from abc import ABC, abstractmethod
+ from collections import deque
+-from collections.abc import Iterable, Iterator
++from collections.abc import Callable, Iterable, Iterator
+ from enum import Enum
++from itertools import count
++from typing import Any
+ 
+ from vllm.v1.request import Request
+ 
+@@ -198,8 +200,91 @@ class PriorityRequestQueue(RequestQueue):
+             yield heapq.heappop(heap_copy)
+ 
+ 
+-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
++class KeyedRequestQueue(RequestQueue):
++    """Heap queue ordered by an explicit scheduler-owned immutable key."""
++
++    def __init__(
++        self,
++        key: Callable[[Request], tuple[Any, ...]],
++        *,
++        preserve_prepend: bool,
++    ) -> None:
++        self._key = key
++        self._preserve_prepend = preserve_prepend
++        self._back_counter = count()
++        self._front_counter = count(start=-1, step=-1)
++        self._heap: list[tuple[tuple[Any, ...], int, int, Request]] = []
++
++    def add_request(self, request: Request) -> None:
++        heapq.heappush(
++            self._heap,
++            (self._key(request), 0, next(self._back_counter), request),
++        )
++
++    def pop_request(self) -> Request:
++        if not self._heap:
++            raise IndexError("pop from empty heap")
++        return heapq.heappop(self._heap)[3]
++
++    def peek_request(self) -> Request:
++        if not self._heap:
++            raise IndexError("peek from empty heap")
++        return self._heap[0][3]
++
++    def prepend_request(self, request: Request) -> None:
++        if not self._preserve_prepend:
++            self.add_request(request)
++            return
++        heapq.heappush(
++            self._heap,
++            (
++                self._key(request),
++                next(self._front_counter),
++                next(self._back_counter),
++                request,
++            ),
++        )
++
++    def prepend_requests(self, requests: RequestQueue) -> None:
++        for request in requests:
++            self.prepend_request(request)
++
++    def remove_request(self, request: Request) -> None:
++        previous_size = len(self._heap)
++        self._heap = [entry for entry in self._heap if entry[3] is not request]
++        if len(self._heap) == previous_size:
++            raise ValueError("request is not in queue")
++        heapq.heapify(self._heap)
++
++    def remove_requests(self, requests: Iterable[Request]) -> None:
++        requests_to_remove = set(requests)
++        self._heap = [
++            entry for entry in self._heap if entry[3] not in requests_to_remove
++        ]
++        heapq.heapify(self._heap)
++
++    def __bool__(self) -> bool:
++        return bool(self._heap)
++
++    def __len__(self) -> int:
++        return len(self._heap)
++
++    def __iter__(self) -> Iterator[Request]:
++        heap_copy = self._heap[:]
++        while heap_copy:
++            yield heapq.heappop(heap_copy)[3]
++
++
++def create_request_queue(
++    policy: SchedulingPolicy,
++    key: Callable[[Request], tuple[Any, ...]] | None = None,
++) -> RequestQueue:
+     """Create request queue based on scheduling policy."""
++    if key is not None:
++        return KeyedRequestQueue(
++            key,
++            preserve_prepend=policy == SchedulingPolicy.FCFS,
++        )
+     if policy == SchedulingPolicy.PRIORITY:
+         return PriorityRequestQueue()
+     elif policy == SchedulingPolicy.FCFS:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 947be4b77..c31c27591 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -46,6 +46,7 @@ from vllm.v1.core.sched.output import (
+     NewRequestData,
+     SchedulerOutput,
+ )
++from vllm.v1.core.sched.qos_policy import QoSSchedulingPolicy
+ from vllm.v1.core.sched.request_queue import (
+     RequestQueue,
+     SchedulingPolicy,
+@@ -94,6 +95,9 @@ class Scheduler(SchedulerInterface):
+             )
+         self.structured_output_manager = structured_output_manager
+         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
++        # Validate the Phase 0-3 envelope before constructing unsupported
++        # connectors or other scheduler-side resources.
++        self.qos_policy = QoSSchedulingPolicy(vllm_config)
+ 
+         # include_finished_set controls whether a separate set of finished
+         # request ids should be included in the EngineCoreOutputs returned
+@@ -179,10 +183,11 @@ class Scheduler(SchedulerInterface):
+             raise ValueError(
+                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
+             ) from e
++        qos_queue_key = self.qos_policy.waiting_key if self.qos_policy.enabled else None
+         # Priority queues for requests.
+-        self.waiting = create_request_queue(self.policy)
++        self.waiting = create_request_queue(self.policy, qos_queue_key)
+         # requests skipped in waiting flow due async deps or constraints.
+-        self.skipped_waiting = create_request_queue(self.policy)
++        self.skipped_waiting = create_request_queue(self.policy, qos_queue_key)
+         self.running: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+@@ -436,6 +441,16 @@ class Scheduler(SchedulerInterface):
+ 
+         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+         num_scheduled_tokens: dict[str, int] = {}
++        scheduled_timestamp = time.monotonic()
++        qos_decision = self.qos_policy.start_step(
++            running=self.running,
++            waiting=itertools.chain(self.waiting, self.skipped_waiting),
++            now=scheduled_timestamp,
++        )
++        original_running_positions = {
++            request: index for index, request in enumerate(self.running)
++        }
++        self.qos_policy.order_running(self.running, active=qos_decision.active)
+         token_budget = self.max_num_scheduled_tokens
+         if self._pause_state == PauseState.PAUSED_ALL:
+             # Do not schedule any requests when paused.
+@@ -449,9 +464,6 @@ class Scheduler(SchedulerInterface):
+         # Whether the running batch contains any prefill requests.
+         prefill_scheduled = False
+ 
+-        # For logging.
+-        scheduled_timestamp = time.monotonic()
+-
+         self.kv_cache_manager.new_step_starts()
+ 
+         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
+@@ -658,7 +670,10 @@ class Scheduler(SchedulerInterface):
+ 
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+-            step_skipped_waiting = create_request_queue(self.policy)
++            step_skipped_waiting = create_request_queue(
++                self.policy,
++                self.qos_policy.waiting_key if self.qos_policy.enabled else None,
++            )
+ 
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+@@ -1150,6 +1165,20 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        if qos_decision.active:
++            current_positions = {
++                request: index for index, request in enumerate(self.running)
++            }
++            self.running.sort(
++                key=lambda request: (
++                    (
++                        0,
++                        original_running_positions[request],
++                    )
++                    if request in original_running_positions
++                    else (1, current_positions[request])
++                )
++            )
+         return scheduler_output
+ 
+     def _build_kv_connector_meta(
+@@ -1664,6 +1693,7 @@ class Scheduler(SchedulerInterface):
+             num_output_tokens_before = len(request._output_token_ids)
+ 
+             # Check for stop and update request status.
++            finished = False
+             if new_token_ids:
+                 new_token_ids, stopped = self._update_request_with_output(
+                     request, new_token_ids
+@@ -1744,6 +1774,12 @@ class Scheduler(SchedulerInterface):
+                 else:
+                     stopped_preempted_reqs.add(request)
+ 
++            self.qos_policy.observe_request_output(
++                request,
++                num_new_tokens=len(new_token_ids),
++                finished=finished,
++            )
++
+             # Extract sample logprobs if needed.
+             if (
+                 request.sampling_params is not None
+@@ -1894,6 +1930,16 @@ class Scheduler(SchedulerInterface):
+             self.waiting.add_request(request)
+ 
+     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
++        if self.qos_policy.enabled and self.waiting and self.skipped_waiting:
++            waiting_req = self.waiting.peek_request()
++            skipped_req = self.skipped_waiting.peek_request()
++            if self.qos_policy.has_qos_request((waiting_req, skipped_req)):
++                if self.qos_policy.waiting_key(
++                    waiting_req
++                ) <= self.qos_policy.waiting_key(skipped_req):
++                    return self.waiting
++                return self.skipped_waiting
++
+         if self.policy == SchedulingPolicy.FCFS:
+             return self.skipped_waiting or self.waiting or None
+ 
+@@ -2039,6 +2085,12 @@ class Scheduler(SchedulerInterface):
+         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
+ 
+     def add_request(self, request: Request) -> None:
++        if request.qos_params is not None and not self.qos_policy.enabled:
++            raise ValueError(
++                "Request QoS parameters require QoS scheduling to be enabled."
++            )
++        if request.qos_params is not None:
++            self.qos_policy.increment_qos_count()
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+@@ -2120,6 +2172,10 @@ class Scheduler(SchedulerInterface):
+                 self.finished_recving_kv_req_ids.discard(request.request_id)
+                 self.failed_recving_kv_req_ids.discard(request.request_id)
+ 
++            # Decrement the QoS request counter for aborted / failed requests
++            # that never reached the normal observe_request_output path.
++            if request.qos_state is not None:
++                self.qos_policy.decrement_qos_count()
+             request.status = finished_status
+             self._free_request(request, delay_free_blocks=delay_free_blocks)
+ 
+@@ -2343,6 +2399,7 @@ class Scheduler(SchedulerInterface):
+             kv_connector_stats=connector_stats_payload,
+             cudagraph_stats=cudagraph_stats,
+             perf_stats=perf_stats,
++            qos_stats=self.qos_policy.drain_stats(),
+         )
+ 
+     def make_spec_decoding_stats(
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index 38ca8dc6d..dd661bad2 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -17,6 +17,7 @@ from vllm.pooling_params import PoolingParams
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
+ from vllm.v1.outputs import LogprobsLists, LogprobsTensors
++from vllm.v1.qos import QoSParams
+ from vllm.v1.serial_utils import UtilityResult
+ 
+ # Type for pause_generation mode parameter.
+@@ -136,6 +137,9 @@ class EngineCoreRequest(
+     # KV-transfer request is rejected on the D node before engine admission.
+     abort_immediately: bool = False
+ 
++    # Appended to preserve positional compatibility of array-like IPC payloads.
++    qos_params: QoSParams | None = None
++
+     @property
+     def params(self) -> SamplingParams | PoolingParams:
+         """Return the processed params (sampling or pooling)."""
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index f3c22a636..626507ca2 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -52,6 +52,7 @@ from vllm.v1.metrics.loggers import (
+ )
+ from vllm.v1.metrics.prometheus import shutdown_prometheus
+ from vllm.v1.metrics.stats import IterationStats
++from vllm.v1.qos import QoSParams
+ 
+ logger = init_logger(__name__)
+ 
+@@ -297,6 +298,7 @@ class AsyncLLM(EngineClient):
+         prompt_text: str | None = None,
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        qos_params: QoSParams | None = None,
+     ) -> RequestOutputCollector:
+         """Add new request to the AsyncLLM."""
+ 
+@@ -317,6 +319,11 @@ class AsyncLLM(EngineClient):
+             )
+ 
+         if isinstance(prompt, AsyncGenerator):
++            if qos_params is not None:
++                raise ValueError(
++                    "Request QoS does not support streaming-input sessions in "
++                    "Phase 0-3."
++                )
+             if reasoning_ended is not None or reasoning_parser_kwargs is not None:
+                 raise NotImplementedError
+ 
+@@ -342,6 +349,11 @@ class AsyncLLM(EngineClient):
+             )
+ 
+             request = prompt
++            if qos_params is not None and request.qos_params != qos_params:
++                raise ValueError(
++                    "qos_params must be carried by a direct EngineCoreRequest."
++                )
++            self.input_processor.validate_engine_core_request(request)
+             if request_id != request.request_id:
+                 logger.warning_once(
+                     "AsyncLLM.add_request() was passed a request_id parameter that "
+@@ -360,6 +372,7 @@ class AsyncLLM(EngineClient):
+                 trace_headers=trace_headers,
+                 priority=priority,
+                 data_parallel_rank=data_parallel_rank,
++                qos_params=qos_params,
+             )
+             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+ 
+@@ -541,6 +554,7 @@ class AsyncLLM(EngineClient):
+         data_parallel_rank: int | None = None,
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
++        qos_params: QoSParams | None = None,
+     ) -> AsyncGenerator[RequestOutput, None]:
+         """
+         Main function called by the API server to kick off a request
+@@ -571,6 +585,7 @@ class AsyncLLM(EngineClient):
+                 prompt_text=prompt_text,
+                 reasoning_ended=reasoning_ended,
+                 reasoning_parser_kwargs=reasoning_parser_kwargs,
++                qos_params=qos_params,
+             )
+ 
+             # The output_handler task pushes items into the queue.
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 10a6329f5..cbc1e1d59 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
+ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
+ from vllm.utils.jsontree import json_iter_leaves
+ from vllm.v1.engine import EngineCoreRequest
++from vllm.v1.qos import QoSParams
+ 
+ logger = init_logger(__name__)
+ 
+@@ -252,9 +253,11 @@ class InputProcessor:
+         priority: int = 0,
+         data_parallel_rank: int | None = None,
+         resumable: bool = False,
++        qos_params: QoSParams | None = None,
+     ) -> EngineCoreRequest:
+         self._validate_params(params, supported_tasks)
+         self._validate_lora(lora_request)
++        self._validate_qos_request(qos_params, params, resumable=resumable)
+ 
+         parallel_config = self.vllm_config.parallel_config
+         dp_size = parallel_config.data_parallel_size
+@@ -382,8 +385,51 @@ class InputProcessor:
+             data_parallel_rank=data_parallel_rank,
+             trace_headers=trace_headers,
+             resumable=resumable,
++            qos_params=qos_params,
+         )
+ 
++    def validate_engine_core_request(self, request: EngineCoreRequest) -> None:
++        """Validate QoS on the deprecated direct EngineCoreRequest path."""
++
++        if request.sampling_params is not None and request.pooling_params is not None:
++            raise ValueError(
++                "EngineCoreRequest cannot contain both sampling and pooling parameters."
++            )
++        params = request.sampling_params or request.pooling_params
++        if params is None:
++            if request.qos_params is not None:
++                raise ValueError(
++                    "Request QoS requires text-generation sampling parameters."
++                )
++            return
++        self._validate_qos_request(
++            request.qos_params,
++            params,
++            resumable=request.resumable,
++        )
++
++    def _validate_qos_request(
++        self,
++        qos_params: QoSParams | None,
++        params: SamplingParams | PoolingParams,
++        *,
++        resumable: bool,
++    ) -> None:
++        if qos_params is None:
++            return
++        if not self.scheduler_config.enable_qos_scheduling:
++            raise ValueError("Request QoS parameters require --enable-qos-scheduling.")
++        if not isinstance(params, SamplingParams):
++            raise ValueError("Request QoS is supported only for text generation.")
++        if params.n != 1:
++            raise ValueError(
++                "Request QoS does not support parallel sampling in Phase 0-3."
++            )
++        if resumable:
++            raise ValueError(
++                "Request QoS does not support streaming-input sessions in Phase 0-3."
++            )
++
+     def _validate_prompt_len(
+         self,
+         prompt_len: int,
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 4e15ed3e5..4fd5401dd 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -36,9 +36,10 @@ from vllm.v1.engine.output_processor import OutputProcessor
+ from vllm.v1.engine.parallel_sampling import ParentRequest
+ from vllm.v1.executor import Executor
+ from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
+-from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
+ from vllm.v1.metrics.prometheus import shutdown_prometheus
++from vllm.v1.metrics.reader import Metric, get_metrics_snapshot
+ from vllm.v1.metrics.stats import IterationStats
++from vllm.v1.qos import QoSParams
+ from vllm.v1.utils import record_function_or_nullcontext
+ from vllm.v1.worker.worker_base import WorkerBase
+ 
+@@ -228,6 +229,7 @@ class LLMEngine:
+         trace_headers: Mapping[str, str] | None = None,
+         priority: int = 0,
+         prompt_text: str | None = None,
++        qos_params: QoSParams | None = None,
+     ) -> str:
+         # Validate the request_id type.
+         if not isinstance(request_id, str):
+@@ -242,6 +244,11 @@ class LLMEngine:
+             )
+ 
+             request = prompt
++            if qos_params is not None and request.qos_params != qos_params:
++                raise ValueError(
++                    "qos_params must be carried by a direct EngineCoreRequest."
++                )
++            self.input_processor.validate_engine_core_request(request)
+             if request_id != request.request_id:
+                 logger.warning_once(
+                     "LLMEngine.add_request() was passed a request_id parameter that "
+@@ -259,6 +266,7 @@ class LLMEngine:
+                 tokenization_kwargs=tokenization_kwargs,
+                 trace_headers=trace_headers,
+                 priority=priority,
++                qos_params=qos_params,
+             )
+             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+ 
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 0ab27359d..b418514eb 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -482,6 +482,53 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+             gauge_scheduler_waiting, per_engine_labelvalues
+         )
+ 
++        def make_qos_gauge(name: str, documentation: str):
++            gauge = self._gauge_cls(
++                name=name,
++                documentation=documentation,
++                multiprocess_mode="mostrecent",
++                labelnames=labelnames,
++            )
++            return create_metric_per_engine(gauge, per_engine_labelvalues)
++
++        self.gauge_qos_active = make_qos_gauge(
++            "vllm:qos_scheduler_active",
++            "Whether the latest scheduler step contained request QoS work.",
++        )
++        self.gauge_qos_total_budget = make_qos_gauge(
++            "vllm:qos_total_token_budget",
++            "Global token budget selected by the QoS scheduler.",
++        )
++        self.gauge_qos_min_decode_slack = make_qos_gauge(
++            "vllm:qos_min_decode_slack_ms",
++            "Minimum next-token deadline slack in milliseconds.",
++        )
++        counter_qos_slo_violations = self._counter_cls(
++            name="vllm:qos_slo_violations_total",
++            documentation="Observed request SLO violations by fixed SLO type.",
++            labelnames=labelnames + ["slo"],
++        )
++        self.counter_qos_slo_violations = {}
++        counter_qos_slo_observations = self._counter_cls(
++            name="vllm:qos_slo_observations_total",
++            documentation=(
++                "Eligible request SLO observations by fixed SLO type; use as "
++                "the denominator for the violation counter."
++            ),
++            labelnames=labelnames + ["slo"],
++        )
++        self.counter_qos_slo_observations = {}
++        for slo in ("ttft", "tbt", "ttlt"):
++            labelvalues_with_slo = {
++                idx: values + [slo] for idx, values in per_engine_labelvalues.items()
++            }
++            self.counter_qos_slo_violations[slo] = create_metric_per_engine(
++                counter_qos_slo_violations, labelvalues_with_slo
++            )
++            self.counter_qos_slo_observations[slo] = create_metric_per_engine(
++                counter_qos_slo_observations, labelvalues_with_slo
++            )
++
+         gauge_waiting_by_reason = self._gauge_cls(
+             name="vllm:num_requests_waiting_by_reason",
+             documentation=(
+@@ -1170,6 +1217,33 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+                     scheduler_stats.available_kv_cache_memory_bytes
+                 )
+ 
++            if (qos_stats := scheduler_stats.qos_stats) is not None:
++                self.gauge_qos_active[engine_idx].set(qos_stats.active)
++                self.gauge_qos_total_budget[engine_idx].set(
++                    qos_stats.total_token_budget
++                )
++                self.gauge_qos_min_decode_slack[engine_idx].set(
++                    qos_stats.min_decode_slack_ms
++                )
++                self.counter_qos_slo_observations["ttft"][engine_idx].inc(
++                    qos_stats.ttft_observations
++                )
++                self.counter_qos_slo_observations["tbt"][engine_idx].inc(
++                    qos_stats.tbt_observations
++                )
++                self.counter_qos_slo_observations["ttlt"][engine_idx].inc(
++                    qos_stats.ttlt_observations
++                )
++                self.counter_qos_slo_violations["ttft"][engine_idx].inc(
++                    qos_stats.ttft_violations
++                )
++                self.counter_qos_slo_violations["tbt"][engine_idx].inc(
++                    qos_stats.tbt_violations
++                )
++                self.counter_qos_slo_violations["ttlt"][engine_idx].inc(
++                    qos_stats.ttlt_violations
++                )
++
+             self.counter_prefix_cache_queries[engine_idx].inc(
+                 scheduler_stats.prefix_cache_stats.queries
+             )
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 81e0cade0..b07b0f480 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -199,6 +199,21 @@ class KVCacheEvictionEvent:
+     reuse_gaps_seconds: tuple[float, ...]
+ 
+ 
++@dataclass(frozen=True)
++class QoSPolicyStats:
++    """Serializable QoS gauges and counter deltas for one stats flush."""
++
++    active: int
++    total_token_budget: int
++    min_decode_slack_ms: float
++    ttft_observations: int
++    tbt_observations: int
++    ttlt_observations: int
++    ttft_violations: int
++    tbt_violations: int
++    ttlt_violations: int
++
++
+ @dataclass
+ class SchedulerStats:
+     """Stats associated with the scheduler."""
+@@ -231,6 +246,8 @@ class SchedulerStats:
+ 
+     perf_stats: PerfStats | None = None
+ 
++    qos_stats: QoSPolicyStats | None = None
++
+ 
+ @dataclass
+ class RequestStateStats:
+diff --git a/vllm/v1/qos.py b/vllm/v1/qos.py
+new file mode 100644
+index 000000000..2c787aa96
+--- /dev/null
++++ b/vllm/v1/qos.py
+@@ -0,0 +1,165 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Request-level QoS metadata and monotonic deadline tracking."""
++
++import math
++import time
++from dataclasses import dataclass
++
++import msgspec
++
++MAX_EXPECTED_OUTPUT_TOKENS = 2**31 - 1
++
++
++class QoSParams(
++    msgspec.Struct,
++    omit_defaults=True,  # type: ignore[call-arg]
++    frozen=True,
++):  # type: ignore[call-arg]
++    """Optional service-level objectives attached to one request.
++
++    The API uses milliseconds because that is the common unit for serving
++    SLOs. Deadlines are converted to the engine-core monotonic clock as soon
++    as a :class:`Request` is created.
++    """
++
++    ttft_slo_ms: float | None = None
++    tbt_slo_ms: float | None = None
++    ttlt_slo_ms: float | None = None
++    expected_output_tokens: int | None = None
++    service_class: str | None = None
++
++    def __post_init__(self) -> None:
++        slos = (self.ttft_slo_ms, self.tbt_slo_ms, self.ttlt_slo_ms)
++        if all(value is None for value in slos):
++            raise ValueError("At least one QoS SLO must be specified.")
++        for name, value in zip(
++            ("ttft_slo_ms", "tbt_slo_ms", "ttlt_slo_ms"), slos, strict=True
++        ):
++            if value is not None and (not math.isfinite(value) or value <= 0):
++                raise ValueError(f"{name} must be a finite positive number.")
++        if self.expected_output_tokens is not None and not (
++            0 < self.expected_output_tokens <= MAX_EXPECTED_OUTPUT_TOKENS
++        ):
++            raise ValueError(
++                f"expected_output_tokens must be in [1, {MAX_EXPECTED_OUTPUT_TOKENS}]."
++            )
++        if self.service_class is not None and (
++            not self.service_class or len(self.service_class) > 64
++        ):
++            raise ValueError("service_class must contain 1 to 64 characters.")
++
++
++@dataclass
++class QoSRuntimeState:
++    """Mutable QoS state kept exclusively inside the engine-core process."""
++
++    ttft_deadline: float | None
++    tbt_slo_s: float | None
++    ttlt_deadline: float | None
++    expected_output_tokens: int
++    service_class: str | None
++    first_token_time: float | None = None
++    last_token_time: float | None = None
++    ttft_observed: bool = False
++    ttlt_observed: bool = False
++
++    @classmethod
++    def from_params(
++        cls,
++        params: QoSParams,
++        *,
++        arrival_time: float,
++        default_expected_output_tokens: int,
++        wall_now: float | None = None,
++        monotonic_now: float | None = None,
++    ) -> "QoSRuntimeState":
++        """Convert frontend wall-clock age into local monotonic deadlines."""
++
++        wall_now = time.time() if wall_now is None else wall_now
++        monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
++        if not all(
++            math.isfinite(value) for value in (arrival_time, wall_now, monotonic_now)
++        ):
++            raise ValueError("QoS timestamps must be finite.")
++        frontend_age_s = max(0.0, wall_now - arrival_time)
++
++        def deadline(slo_ms: float | None) -> float | None:
++            if slo_ms is None:
++                return None
++            return monotonic_now + slo_ms / 1000.0 - frontend_age_s
++
++        expected_output_tokens = (
++            params.expected_output_tokens
++            if params.expected_output_tokens is not None
++            else default_expected_output_tokens
++        )
++        return cls(
++            ttft_deadline=deadline(params.ttft_slo_ms),
++            tbt_slo_s=(
++                None if params.tbt_slo_ms is None else params.tbt_slo_ms / 1000.0
++            ),
++            ttlt_deadline=deadline(params.ttlt_slo_ms),
++            expected_output_tokens=expected_output_tokens,
++            service_class=params.service_class,
++        )
++
++    def next_token_deadline(self) -> float:
++        """Return the earliest active deadline for the next generated token."""
++
++        deadlines: list[float] = []
++        if self.first_token_time is None:
++            if self.ttft_deadline is not None:
++                deadlines.append(self.ttft_deadline)
++        elif self.tbt_slo_s is not None and self.last_token_time is not None:
++            deadlines.append(self.last_token_time + self.tbt_slo_s)
++        if self.ttlt_deadline is not None:
++            deadlines.append(self.ttlt_deadline)
++        return min(deadlines, default=math.inf)
++
++    def has_active_deadline(self) -> bool:
++        """Whether an SLO still constrains the request's current phase."""
++
++        return math.isfinite(self.next_token_deadline())
++
++    def waiting_deadline(self) -> float:
++        """Return the phase-correct deadline while the request is queued.
++
++        A decode request may return to the waiting queue after preemption. In
++        that case its TBT deadline, rather than its already-observed TTFT
++        deadline, must determine its queue order.
++        """
++
++        return self.next_token_deadline()
++
++    def observe_tokens(self, num_new_tokens: int, now: float) -> tuple[int, int]:
++        """Record generated tokens and return TTFT/TBT violation deltas."""
++
++        if num_new_tokens <= 0:
++            return 0, 0
++
++        ttft_violations = 0
++        tbt_violations = 0
++        if not self.ttft_observed:
++            if self.ttft_deadline is not None and now > self.ttft_deadline:
++                ttft_violations = 1
++            self.ttft_observed = True
++            self.first_token_time = now
++        elif (
++            self.tbt_slo_s is not None
++            and self.last_token_time is not None
++            and now - self.last_token_time > self.tbt_slo_s
++        ):
++            tbt_violations = 1
++
++        self.last_token_time = now
++        return ttft_violations, tbt_violations
++
++    def observe_finished(self, now: float) -> int:
++        """Record completion and return the TTLT violation delta."""
++
++        if self.ttlt_observed:
++            return 0
++        self.ttlt_observed = True
++        return int(self.ttlt_deadline is not None and now > self.ttlt_deadline)
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 0e8d4ee00..34802f1f2 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -21,6 +21,7 @@ from vllm.v1.engine import (
+     FinishReason,
+ )
+ from vllm.v1.metrics.stats import PrefillStats
++from vllm.v1.qos import QoSParams, QoSRuntimeState
+ from vllm.v1.structured_output.request import StructuredOutputRequest
+ from vllm.v1.utils import ConstantList
+ 
+@@ -77,6 +78,7 @@ class Request:
+         reasoning_ended: bool | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
+         abort_immediately: bool = False,
++        qos_params: QoSParams | None = None,
+     ) -> None:
+         self.request_id = request_id
+         self.client_index = client_index
+@@ -118,6 +120,19 @@ class Request:
+         else:
+             raise ValueError("sampling_params and pooling_params can't both be unset")
+ 
++        if qos_params is not None and sampling_params is None:
++            raise ValueError("Request QoS is supported only for text generation.")
++        self.qos_params = qos_params
++        self.qos_state = (
++            None
++            if qos_params is None
++            else QoSRuntimeState.from_params(
++                qos_params,
++                arrival_time=self.arrival_time,
++                default_expected_output_tokens=self.max_tokens,
++            )
++        )
++
+         self.prompt_token_ids = prompt_token_ids
+         self.prompt_embeds = prompt_embeds
+         # Per-position mask used in mixed-mode (chat completion with
+@@ -219,6 +234,7 @@ class Request:
+             reasoning_ended=request.reasoning_ended,
+             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+             abort_immediately=request.abort_immediately,
++            qos_params=request.qos_params,
+         )
+ 
+     def append_output_token_ids(
+-- 
+2.53.0.windows.3
+
