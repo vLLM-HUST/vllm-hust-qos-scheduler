@@ -1,0 +1,44 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-hust-qos-scheduler",
+  "display_name": "QoS Scheduler",
+  "evidence": {
+    "index": "https://github.com/vLLM-HUST/vllm-hust-qos-scheduler",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-hust-qos-scheduler",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable the MOD and return to the unmodified host path.",
+    "status": "incubating"
+  },
+  "metadata_source": {
+    "commit": "7df1647048ac5f05fcc502ce4bea94f26d0f5362",
+    "repository": "vLLM-HUST/vllm-hust-website"
+  },
+  "mod_id": "qos-scheduler-migration",
+  "repository": "vllm-hust-qos-scheduler",
+  "responsibility": {
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Xiong Wang / 王雄",
+        "relationship": "internal"
+      }
+    ],
+    "maintainers": [
+      {
+        "github": "Yushuo-star",
+        "name": "郁硕"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "scheduler_policy",
+    "out_of_scope": [],
+    "supported_workloads": []
+  }
+}
